@@ -167,11 +167,23 @@ class Database:
 
     # ---------------- blobs ----------------
 
-    def create_blob(self, digest: str, size: int):
+    def upsert_blob(self, digest: str, size: int):
+        """登记/刷新 blob 记录。
+
+        新 blob 插入；同名 blob 重新提交（同摘要重传、跨仓库挂载）时把
+        created_at 刷为当前时刻并修正 size：提交发生在 GC 跨进程排他临界区
+        内，刷新后执行复核会因「仍在宽限期内」跳过它，杜绝「重传已返回
+        201、GC 随后把文件删掉」的悬空窗口（宽限期为 0 时由区间串行本身
+        保证：提交先于复核完成 -> 已被标签可达性覆盖；GC 先删完 -> 提交时
+        记录与文件都不存在，走完整重建）。
+        """
+        now = time.time()
         with self._lock, self._conn:
             self._conn.execute(
-                "INSERT OR IGNORE INTO blobs (digest, size, created_at) VALUES (?, ?, ?)",
-                (digest, size, time.time()),
+                "INSERT INTO blobs (digest, size, created_at) VALUES (?, ?, ?)"
+                " ON CONFLICT(digest) DO UPDATE SET size = excluded.size,"
+                " created_at = excluded.created_at",
+                (digest, size, now),
             )
 
     def get_blob(self, digest: str) -> "dict | None":

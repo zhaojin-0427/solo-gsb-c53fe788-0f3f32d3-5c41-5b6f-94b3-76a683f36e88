@@ -39,14 +39,20 @@ class FileStorage:
         except OSError:
             pass
 
-    def commit_blob(self, tmp_path: Path, digest: str) -> int:
-        """把上传临时文件落为内容寻址 blob；已存在则去重（删临时文件）。"""
+    def install_blob(self, tmp_path: Path, digest: str) -> int:
+        """把**摘要已校验**的上传临时文件原子落为内容寻址 blob。
+
+        与旧的「见同名文件即去重、丢弃新内容」不同：这里始终 os.replace
+        覆盖目标。内容寻址存储中同摘要必然同内容，覆盖只会得到逐字节相同
+        的文件，却能在「GC 已删元数据记录、旧文件尚未删除」的残留窗口里
+        用刚校验过的完整内容重建文件，而不是把新上传误判为去重后丢弃。
+
+        调用方必须持有与 GC 删除区间互斥的跨进程排他锁——正常并发下该
+        残留窗口根本观察不到；无条件安装属于崩溃/外部干预残留的防御性自愈。
+        """
         target = self.blob_path(digest)
-        if target.exists():
-            Path(tmp_path).unlink(missing_ok=True)
-        else:
-            target.parent.mkdir(parents=True, exist_ok=True)
-            os.replace(tmp_path, target)  # 同文件系统内原子改名
+        target.parent.mkdir(parents=True, exist_ok=True)
+        os.replace(tmp_path, target)  # 同文件系统内原子改名（覆盖同名文件）
         return target.stat().st_size
 
     def sweep_orphan_blobs(self, known_digests: set, older_than_ts: float) -> list:

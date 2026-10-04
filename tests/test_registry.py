@@ -1047,6 +1047,457 @@ def test_cross_process_gc_deletes_before_publish_put_rejected_no_tag(settings):
     assert verifier.get(f"/v2/{repo}/blobs/{digest_of(keep_cfg)}").status_code == 200
 
 
+# ---------------- 同摘要重传 / 挂载 vs GC 复核删除 ----------------
+
+def test_retransmit_heals_row_deleted_file_lingering_window(client, settings):
+    """旧漏洞的精确序列：GC 已删 SQLite 记录、旧文件尚未删除时同摘要重传，
+    随后 GC 删掉文件。
+
+    旧实现 commit_blob 见旧文件便丢弃新内容、只重建关联，GC 随后删文件 ->
+    重传 201、PUT manifest 201，而 GET blob 404（悬空标签）。修复后重传的
+    install_blob 用摘要校验过的内容无条件原子安装（不是命中旧文件去重），
+    upsert 重建记录；GC 最后一步 unlink 删的是这次安装的同一内容文件，但
+    真实 gc_execute 整段持跨进程排他锁、重传不可能夹在记录与文件删除之间，
+    因此这里分两个层面断言：
+
+    1. 直接构造「记录已删、文件残留」窗口（真实并发被 flock 屏蔽）时，重传
+       安装的内容与摘要一致、记录与关联被重建——不再是「丢弃新内容」；
+    2. 标签发布后 blob 可拉取、内容正确。
+    """
+    registry = client.app.state.registry
+    payload = b"same digest retransmit payload"
+    d = push_blob(client, "demo/app", payload)
+
+    # 直接构造「记录已删、文件残留」窗口（gc_execute 持锁时它对其它进程不可见）
+    with registry.lock:
+        registry.db.delete_blobs([d])
+        assert registry.storage.has_blob(d)          # 物理文件还在
+        assert registry.db.get_blob(d) is None       # 记录已删
+
+    # 同摘要重传命中残留文件：旧实现会丢弃 payload；修复后必须以校验过的
+    # 内容原子安装并重建记录/关联
+    r = client.post(f"/v2/demo/app/blobs/uploads?digest={d}", content=payload)
+    assert r.status_code == 201, r.text
+    assert r.headers["Docker-Content-Digest"] == d
+
+    # 记录、关联都在，磁盘文件是这次安装的完整内容（可跨实例读校验）
+    assert registry.db.get_blob(d) is not None
+    assert registry.db.repo_has_blob("demo/app", d)
+    got = client.get(f"/v2/demo/app/blobs/{d}")
+    assert got.status_code == 200 and got.content == payload
+
+    # 关键不变量：发布引用它的标签，标签可见时 blob 必可拉取
+    manifest = _layer_only_manifest(d, len(payload))
+    push_manifest(client, "demo/app", "v1", manifest)
+    assert client.get("/v2/demo/app/manifests/v1").status_code == 200
+    assert client.get(f"/v2/demo/app/blobs/{d}").status_code == 200
+    assert client.get(f"/v2/demo/app/blobs/{d}").content == payload
+
+
+def test_gc_fully_deleted_then_retransmit_rebuilds_complete_file(client):
+    """GC 先删完（记录与文件都消失）-> 单块重传在锁后完整重建。"""
+    registry = client.app.state.registry
+    payload = b"rebuilt after full delete"
+    d = push_blob(client, "demo/app", payload)
+    with registry.lock:
+        registry.db.delete_blobs([d])
+        registry.storage.delete_blob(d)
+
+    r = client.post(f"/v2/demo/app/blobs/uploads?digest={d}", content=payload)
+    assert r.status_code == 201
+    got = client.get(f"/v2/demo/app/blobs/{d}")
+    assert got.status_code == 200 and got.content == payload
+    # created_at 已刷新为当前时刻：受宽限期保护，不会被刚执行的计划回收
+    assert registry.db.get_blob(d)["created_at"] > time.time() - 60
+
+
+def test_gc_fully_deleted_then_chunked_finalize_rebuilds(client):
+    """GC 先删完 -> 分块 PUT 完成在锁后完整重建（不依赖旧文件去重）。"""
+    registry = client.app.state.registry
+    data = b"chunked-rebuild-" * 10
+    d = digest_of(data)
+    push_blob(client, "demo/app", data)
+    with registry.lock:
+        registry.db.delete_blobs([d])
+        registry.storage.delete_blob(d)
+
+    # 重新走一个完整的分块上传会话
+    loc = client.post("/v2/demo/app/blobs/uploads").headers["Location"]
+    assert client.patch(loc, content=data[:70]).status_code == 202
+    r = client.put(f"{loc}?digest={d}", content=data[70:])
+    assert r.status_code == 201
+    got = client.get(f"/v2/demo/app/blobs/{d}")
+    assert got.status_code == 200 and got.content == data
+
+
+def test_gc_deleted_then_mount_falls_back_to_upload_session(client):
+    """GC 先删完 -> 跨仓库挂载不返回 201（不能关联到缺失文件），按规范回退 202。"""
+    registry = client.app.state.registry
+    d = push_blob(client, "src/repo", b"mount source")
+    with registry.lock:
+        registry.db.delete_blobs([d])
+        registry.storage.delete_blob(d)
+
+    r = client.post(f"/v2/dst/repo/blobs/uploads?mount={d}&from=src/repo")
+    assert r.status_code == 202          # 回退为普通上传会话
+    assert r.headers["Location"].startswith("/v2/dst/repo/blobs/uploads/")
+    assert client.get(f"/v2/dst/repo/blobs/{d}").status_code == 404
+
+
+def test_mount_mid_window_row_gone_file_lingers_also_falls_back(client):
+    """挂载在「记录已删、文件残留」窗口：blob_exists 为假 -> 同样回退 202，
+    绝不重建指向将被删除文件的关联。"""
+    registry = client.app.state.registry
+    d = push_blob(client, "src/repo", b"mid window mount")
+    with registry.lock:
+        registry.db.delete_blobs([d])    # 记录删除、文件残留
+        assert registry.storage.has_blob(d)
+    r = client.post(f"/v2/dst/repo/blobs/uploads?mount={d}&from=src/repo")
+    assert r.status_code == 202
+    assert client.get(f"/v2/dst/repo/blobs/{d}").status_code == 404
+
+
+def test_retransmit_refreshes_grace_window_gc_skips(client):
+    """重传先提交（默认宽限期）：created_at 刷新，GC 执行复核时仍在宽限期内，
+    候选进入 skipped 而不是删除。"""
+    registry = client.app.state.registry
+    payload = b"grace refreshed on retransmit"
+    d = push_blob(client, "demo/app", payload)
+    with registry.lock:
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+
+    plan = client.post("/gc", json={"dry_run": True}).json()  # 默认 3600s 宽限
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+
+    # 复核窗口内同摘要重传 -> 宽限时间戳刷新
+    assert client.post(f"/v2/demo/app/blobs/uploads?digest={d}",
+                       content=payload).status_code == 201
+
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["blobs_deleted"] == 0
+    assert rep["summary"]["blobs_skipped"] == 1
+    assert rep["skipped"]["blobs"][0]["digest"] == d
+    assert "grace" in rep["skipped"]["blobs"][0]["reason"]
+    got = client.get(f"/v2/demo/app/blobs/{d}")
+    assert got.status_code == 200 and got.content == payload
+
+
+def test_mount_refreshes_grace_window_gc_skips(client):
+    """跨仓库挂载先提交：同样刷新宽限窗口，GC 跳过该候选。"""
+    registry = client.app.state.registry
+    payload = b"mount grace refreshed"
+    d = push_blob(client, "src/repo", payload)
+    with registry.lock:
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+
+    plan = client.post("/gc", json={"dry_run": True}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+
+    r = client.post(f"/v2/dst/repo/blobs/uploads?mount={d}&from=src/repo")
+    assert r.status_code == 201
+
+    rep = client.post("/gc", json={"dry_run": False,
+                                   "plan_id": plan["plan_id"]}).json()
+    assert rep["summary"]["blobs_deleted"] == 0
+    assert rep["skipped"]["blobs"][0]["digest"] == d
+    assert client.get(f"/v2/dst/repo/blobs/{d}").status_code == 200
+    assert client.get(f"/v2/dst/repo/blobs/{d}").content == payload
+
+
+def _retransmit_worker(data_dir, mode, payload, digest, entered, queue):
+    """独立进程：发起一次 blob 提交（单块/分块完成/挂载）。进入跨进程排他
+    临界区时置位 entered，用于与 GC 进程确定性排序（提交先于 GC 复核）。"""
+    import contextlib as _ctx
+    try:
+        settings = Settings(data_dir=data_dir, upload_lease_seconds=3600,
+                            gc_grace_seconds=3600)
+        registry = Registry(settings)
+        _exclusive_orig = registry.xlock.exclusive
+
+        @_ctx.contextmanager
+        def _exclusive_signaled():
+            with _exclusive_orig():
+                entered.set()
+                yield
+
+        registry.xlock.exclusive = _exclusive_signaled
+        if mode == "mono":
+            size = registry.monolithic_upload("race", payload, digest)
+            queue.put({"status": 201, "size": size[1]})
+        elif mode == "chunk":
+            uid = registry.start_upload("race")["id"]
+            path = registry.storage.upload_path(uid)
+            with open(path, "wb") as f:
+                f.write(payload)
+            out_digest, size = registry.finalize_upload("race", uid, digest)
+            queue.put({"status": 201, "digest": out_digest, "size": size})
+        elif mode == "mount":
+            ok = registry.mount_blob("race", digest)
+            queue.put({"status": 201 if ok else 202, "mounted": ok})
+        else:
+            raise AssertionError(mode)
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        queue.put({"fatal": f"{exc!r}\n{traceback.format_exc()}"})
+
+
+def _gc_worker_result(data_dir, plan_id, digest, entered, queue, hold_seconds=0.0):
+    """独立进程执行 GC，进入排他临界区时置位 entered，返回删除结果。"""
+    import contextlib as _ctx
+    try:
+        settings = Settings(data_dir=data_dir, upload_lease_seconds=3600,
+                            gc_grace_seconds=3600)
+        registry = Registry(settings)
+        _exclusive_orig = registry.xlock.exclusive
+
+        @_ctx.contextmanager
+        def _exclusive_signaled():
+            with _exclusive_orig():
+                entered.set()
+                if hold_seconds:
+                    time.sleep(hold_seconds)
+                yield
+
+        registry.xlock.exclusive = _exclusive_signaled
+        try:
+            rep = registry.gc_execute(plan_id)
+            queue.put({
+                "status": 200,
+                "blob_gone": registry.db.get_blob(digest) is None,
+                "blobs_deleted": rep["summary"]["blobs_deleted"],
+                "blobs_skipped": rep["summary"]["blobs_skipped"],
+            })
+        except OCIError as exc:
+            queue.put({"status": exc.status_code, "code": exc.code})
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        queue.put({"fatal": f"{exc!r}\n{traceback.format_exc()}"})
+
+
+@pytest.mark.parametrize("mode", ["mono", "chunk"])
+def test_cross_process_gc_deletes_first_retransmit_rebuilds(settings, mode):
+    """GC 持锁先删完记录与文件，重传进程（单块/分块）在锁后提交 -> 完整
+    重建：201，blob 可拉取、内容正确；再发布标签也 201 且引用可拉取。"""
+    data_dir = str(settings.data_dir)
+    client = TestClient(create_app(settings))
+    payload = f"xproc gc first {mode} ".encode() * 4
+    d = push_blob(client, "race", payload)
+    registry = client.app.state.registry
+    with registry.lock:
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    registry.db._conn.commit()
+
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+    in_gc = ctx.Event()
+    committed = ctx.Event()
+    gc = ctx.Process(target=_gc_worker_result,
+                     args=(data_dir, plan["plan_id"], d, in_gc, queue, 1.0))
+    uploader = ctx.Process(target=_retransmit_worker,
+                           args=(data_dir, mode, payload, d, committed, queue))
+    gc.start()
+    assert in_gc.wait(10), "GC never entered its critical section"
+    # GC 正在持锁删除；重传此刻发起，阻塞在 flock 上直到 GC 删完
+    uploader.start()
+    time.sleep(0.5)
+    assert uploader.is_alive(), "upload must be blocked while GC holds the lock"
+    for p in (gc, uploader):
+        p.join(timeout=15)
+        assert not p.is_alive(), f"{p.name} timed out"
+        p.close()
+
+    results = []
+    while not queue.empty():
+        results.append(queue.get_nowait())
+    assert all("fatal" not in r for r in results), results
+    gcr = next(r for r in results if "blob_gone" in r)
+    upr = next(r for r in results if r.get("status") == 201 and "mounted" not in r)
+    assert gcr["status"] == 200 and gcr["blob_gone"] is True, results
+    assert upr["status"] == 201, results
+
+    # 重传落下完整文件：可拉取、内容正确
+    verifier = TestClient(create_app(settings))
+    got = verifier.get(f"/v2/race/blobs/{d}")
+    assert got.status_code == 200 and got.content == payload
+    manifest = _layer_only_manifest(d, len(payload))
+    push_manifest(verifier, "race", "late-tag", manifest)
+    assert verifier.get("/v2/race/manifests/late-tag").status_code == 200
+    assert verifier.get(f"/v2/race/blobs/{d}").status_code == 200
+
+
+@pytest.mark.parametrize("mode", ["mono", "mount"])
+def test_cross_process_retransmit_first_gc_skips_candidate(settings, mode):
+    """重传/挂载先在排他临界区提交（created_at 刷新到当前时刻），GC 拿锁
+    复核时候选仍在宽限期内 -> skipped 不删除；201 已返回的 blob 可拉取。"""
+    data_dir = str(settings.data_dir)
+    client = TestClient(create_app(settings))
+    payload = f"xproc commit first {mode} ".encode() * 4
+    d = push_blob(client, "race", payload)
+    if mode == "mount":
+        # mount 需要一个已关联到源仓库的 blob；目标仓库 race 尚未关联
+        pass
+    registry = client.app.state.registry
+    with registry.lock:
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+    # 计划以默认 3600s 宽限生成：老 blob 此刻已超宽限，是计划内候选
+    plan = client.post("/gc", json={"dry_run": True}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+    registry.db._conn.commit()
+
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+    committed = ctx.Event()
+    in_gc = ctx.Event()
+    uploader = ctx.Process(target=_retransmit_worker,
+                           args=(data_dir, mode, payload, d, committed, queue))
+    gc = ctx.Process(target=_gc_worker_result,
+                     args=(data_dir, plan["plan_id"], d, in_gc, queue))
+    uploader.start()
+    assert committed.wait(10), "uploader never committed inside its critical section"
+    # 提交已完成（锁已释放）；GC 才复核
+    gc.start()
+    for p in (uploader, gc):
+        p.join(timeout=15)
+        assert not p.is_alive(), f"{p.name} timed out"
+        p.close()
+
+    results = []
+    while not queue.empty():
+        results.append(queue.get_nowait())
+    assert all("fatal" not in r for r in results), results
+    upr = next(r for r in results if "mounted" in r or "size" in r)
+    gcr = next(r for r in results if "blob_gone" in r)
+    assert upr["status"] == 201, results
+    if mode == "mount":
+        assert upr["mounted"] is True
+    assert gcr["status"] == 200 and gcr["blob_gone"] is False, results
+    assert gcr["blobs_deleted"] == 0 and gcr["blobs_skipped"] == 1
+
+    verifier = TestClient(create_app(settings))
+    got = verifier.get(f"/v2/race/blobs/{d}")
+    assert got.status_code == 200 and got.content == payload
+
+
+# ---------------- 跨进程锁本身：线程安全的读写锁 ----------------
+
+def test_cross_process_lock_same_process_mixed_sh_ex_threads(tmp_path):
+    """旧实现用进程级共享的 depth/mode：同进程不同线程并发 SH 与 EX 会抛
+    RuntimeError（模式冲突）。修复后每线程独立 fd + 进程内读写门，并发不报错。"""
+    from app.coord import CrossProcessLock
+    lk = CrossProcessLock(tmp_path / "registry.lock")
+    errors = []
+
+    def reader():
+        for _ in range(30):
+            try:
+                with lk.shared():
+                    time.sleep(0.001)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("sh", repr(exc)))
+
+    def writer():
+        for _ in range(30):
+            try:
+                with lk.exclusive():
+                    time.sleep(0.001)
+            except Exception as exc:  # noqa: BLE001
+                errors.append(("ex", repr(exc)))
+
+    threads = [threading.Thread(target=reader) for _ in range(3)] + \
+              [threading.Thread(target=writer) for _ in range(3)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not errors, errors
+
+
+def test_cross_process_lock_exclusive_excludes_same_process_threads(tmp_path):
+    from app.coord import CrossProcessLock
+    lk = CrossProcessLock(tmp_path / "registry.lock")
+    active = {"ex": 0, "sh": 0}
+    violations = []
+
+    def reader():
+        for _ in range(40):
+            with lk.shared():
+                active["sh"] += 1
+                if active["ex"]:
+                    violations.append("SH ran while EX held")
+                time.sleep(0.0005)
+                active["sh"] -= 1
+
+    def writer():
+        for _ in range(40):
+            with lk.exclusive():
+                active["ex"] += 1
+                if active["sh"] or active["ex"] > 1:
+                    violations.append("EX overlapped another holder")
+                time.sleep(0.0005)
+                active["ex"] -= 1
+
+    threads = [threading.Thread(target=reader) for _ in range(4)] + \
+              [threading.Thread(target=writer) for _ in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert not violations, violations
+
+
+def test_cross_process_lock_reentrant_same_thread_same_mode(tmp_path):
+    from app.coord import CrossProcessLock
+    lk = CrossProcessLock(tmp_path / "registry.lock")
+    with lk.exclusive():
+        with lk.exclusive():
+            pass
+    with lk.shared():
+        with lk.shared():
+            pass
+    # 同线程 EX/SH 互相嵌套仍被拒绝
+    with pytest.raises(RuntimeError):
+        with lk.exclusive():
+            with lk.shared():
+                pass
+
+
+def test_concurrent_blob_upload_ex_and_gc_dry_run_sh_same_process(client):
+    """回归：blob 提交（EX）与 GC dry-run（SH）在同一进程的不同线程并发，
+    不得因锁实现抛 500；两路都成功，已推送 blob 不受影响。"""
+    payloads = [f"concurrent-blob-{i}".encode() for i in range(8)]
+    errors = []
+
+    def uploader():
+        try:
+            for p in payloads:
+                d = digest_of(p)
+                r = client.post(f"/v2/lock/app/blobs/uploads?digest={d}", content=p)
+                assert r.status_code == 201, r.text
+        except Exception as exc:  # noqa: BLE001
+            errors.append(("upload", repr(exc)))
+
+    def dryrunner():
+        try:
+            for _ in range(8):
+                r = client.post("/gc", json={"dry_run": True})
+                assert r.status_code == 200, r.text
+                time.sleep(0.001)
+        except Exception as exc:  # noqa: BLE001
+            errors.append(("dryrun", repr(exc)))
+
+    t1, t2 = threading.Thread(target=uploader), threading.Thread(target=dryrunner)
+    t1.start(); t2.start(); t1.join(); t2.join()
+    assert not errors, errors
+    for p in payloads:
+        assert client.get(f"/v2/lock/app/blobs/{digest_of(p)}").status_code == 200
+
+
 # ---------------- 重启恢复 ----------------
 
 def test_upload_survives_restart(settings):
