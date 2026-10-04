@@ -6,21 +6,39 @@
    blob 时在锁内打开文件句柄，锁外流式发送——即使 GC 随后删除文件，
    POSIX 下已打开的 fd 依然可读，因此并发拉取不会被误删打断。
 2. 跨进程（多个进程挂载同一数据目录）时进程锁互不相见，由一把
-   CrossProcessLock（fcntl.flock 文件锁）串行化两类关键区间：
+   CrossProcessLock（fcntl.flock 文件锁）串行化三类关键区间：
 
    - 发布 manifest：从 config/layers/子 manifest 引用存在性校验、
      manifest 落库到标签 CAS 提交，全程持排他锁；
+   - blob 提交：单块整体上传（POST ?digest=）、分块上传完成
+     （PUT ?digest=）以及跨仓库挂载（?mount=）的「内容就位 ->
+     blobs/repo_blobs 关联落库」全程持排他锁；分块的最后落盘与大文件
+     sha256 摘要复核在会话独占临时文件上、跨进程锁外完成，不阻塞其它
+     仓库的并发提交；
    - GC 执行：gc_plans 计划原子认领（pending -> executing）之后，
      从可达性/租约复核、元数据删除到 blob 文件删除，全程持排他锁。
 
-   两区间因此跨进程严格串行，杜绝「发布引用校验已过、标签未提交，
-   GC 先删了 blob；随后标签可见但 blob 404」的悬空引用：
+   三个区间因此跨进程严格串行。发布与 GC 之间杜绝「发布引用校验已过、
+   标签未提交，GC 先删了 blob；随后标签可见但 blob 404」的悬空引用：
 
    * 发布先完成 -> 标签已提交，GC 复核时 blob/候选 manifest 重新可达，
      进入 skipped 而不是删除；
    * GC 先完成 -> 引用的 blob 元数据与文件都已删除，发布校验失败，
      PUT 返回 400 MANIFEST_BLOB_UNKNOWN 且标签未写入；既有标签未变，
      其引用全部可拉取。
+
+   同摘要重传（单块/分块提交）与跨仓库挂载和 GC 之间同理，杜绝
+   「GC 已删 blob 元数据、文件未删，重传方 commit_blob 见旧文件而丢弃
+   新内容却重建关联，GC 随后删文件，标签发布 201 而 blob 404」：
+
+   * GC 先完成 -> 重传方在锁外等到元数据与文件都删完才继续，
+     os.replace 把刚校验过的完整内容落为新文件，并重建 blobs/
+     repo_blobs 记录（新记录受宽限期保护），随后发布标签 201、
+     拉取 blob 200；挂载方则观察到 blob 已不存在，按规范回退为
+     普通上传会话（202）；
+   * 重传/挂载先完成 -> 元数据关联先于 GC 成为既成事实；若此时标签
+     已发布，GC 复核到候选重新可达而跳过；若始终没有标签引用，GC
+     按可达性/宽限期正常复核，不会出现有记录无文件的悬空 blob。
 
    flock 随进程死亡由内核自动释放，不会形成僵死锁；dry-run 持共享锁
    拍摄快照，多个 dry-run 可并行，但都不会看到发布进行到一半的状态。
@@ -202,10 +220,14 @@ class Registry:
                 )
             if u["state"] != "active" or u["expires_at"] <= time.time():
                 raise E.upload_unknown(upload_id)
-
             path = self.storage.upload_path(upload_id)
             if not path.exists():
                 raise E.upload_unknown(upload_id)
+
+            # 最后分块落盘与摘要复核在进程锁内、跨进程锁外完成：临时文件
+            # 为本会话独占（其它进程/GC 都不写它），大文件 sha256 可能耗时，
+            # 不持全局 flock 以免阻塞其它仓库的并发上传与 GC。进程锁一直持有，
+            # 保证同进程的 PATCH 追加/DELETE 取消不会插入到复核与提交之间。
             if chunk:
                 with open(path, "ab") as f:
                     f.write(chunk)
@@ -216,28 +238,64 @@ class Registry:
                 self.db.set_upload_state(upload_id, "cancelled")
                 raise E.digest_mismatch(expected=digest, computed=computed)
 
-            size = self.storage.commit_blob(path, digest)  # 按摘要去重
-            self.db.create_blob(digest, size)
-            self.db.link_repo_blob(repo, digest)
-            self.db.set_upload_state(upload_id, "committed", digest)
-            return digest, size
+            # 跨进程临界区（只包住原子就位 -> 关联落库 -> committed）：
+            # 与 GC 的「复核 -> 元数据删除 -> 文件删除」严格串行。等锁期间
+            # 另一进程可能已用同一会话幂等提交，故拿锁后重新判定状态。
+            # GC 先删完时这里目标文件已不存在，os.replace 必然把上面刚复核
+            # 过的完整内容落为新文件并重建关联（而非见旧文件丢弃新内容）。
+            with self.xlock.exclusive():
+                u = self.db.get_upload(upload_id)
+                if u is not None and u["repo"] == repo and u["state"] == "committed":
+                    if u["digest"] == digest and self.db.repo_has_blob(repo, digest):
+                        blob = self.db.get_blob(digest)
+                        return digest, blob["size"] if blob else 0
+                    raise E.upload_invalid(
+                        "upload already committed with a different digest",
+                        {"upload_id": upload_id},
+                    )
+                if (u is None or u["repo"] != repo or u["state"] != "active"
+                        or u["expires_at"] <= time.time()
+                        or not self.storage.upload_path(upload_id).exists()):
+                    raise E.upload_unknown(upload_id)
+
+                size = self.storage.commit_blob(path, digest)  # 按摘要去重
+                self.db.create_blob(digest, size)
+                self.db.link_repo_blob(repo, digest)
+                self.db.set_upload_state(upload_id, "committed", digest)
+                return digest, size
 
     def monolithic_upload(self, repo: str, payload: bytes, digest: str):
         computed = sha256_bytes(payload)
         if computed != digest:
             raise E.digest_mismatch(expected=digest, computed=computed)
+        # 摘要已在内存复核。写入独占临时文件（随机 uuid，无其它请求会碰它）
+        # 在跨进程锁外完成；flock 只包住「就位 -> 关联落库」这一小段，与 GC
+        # 的「删元数据 -> 删文件」原子互斥。否则 GC 可能在「已删 blobs 记录、
+        # 未删文件」的窗口里与本请求交错：commit_blob 见旧文件丢弃新内容，却
+        # 重建关联，GC 随后删文件 -> 记录悬空（标签发布 201、blob 404）。
         with self.lock:
             tmp = self.storage.upload_path(uuid.uuid4().hex)
-            with open(tmp, "wb") as f:
-                f.write(payload)
-            size = self.storage.commit_blob(tmp, digest)
-            self.db.create_blob(digest, size)
-            self.db.link_repo_blob(repo, digest)
+            try:
+                with open(tmp, "wb") as f:
+                    f.write(payload)
+                with self.xlock.exclusive():
+                    size = self.storage.commit_blob(tmp, digest)
+                    self.db.create_blob(digest, size)
+                    self.db.link_repo_blob(repo, digest)
+            except BaseException:
+                tmp.unlink(missing_ok=True)
+                raise
             return digest, size
 
     def mount_blob(self, repo: str, digest: str) -> bool:
-        """跨仓库挂载：blob 已存在则直接关联，实现秒级去重推送。"""
-        with self.lock:
+        """跨仓库挂载：blob 已存在则直接关联，实现秒级去重推送。
+
+        检查与关联在跨进程排他临界区内完成，与 GC 删除串行：GC 先删完
+        时本方法观察到 blob 不存在而返回 False（路由按规范回退为普通
+        上传会话）；本方法先关联成功时，随后的 GC 复核若候选仍无标签
+        引用则按宽限期正常处理，不会产生有记录无文件的悬空关联。
+        """
+        with self.lock, self.xlock.exclusive():
             if not self.db.blob_exists(digest) or not self.storage.has_blob(digest):
                 return False
             self.db.link_repo_blob(repo, digest)
@@ -344,10 +402,14 @@ class Registry:
     #               认领成功者继续），再持排他 flock：重算可达性/租约，只删除
     #               “计划内且仍符合条件”的对象（先元数据后文件），全部删完才
     #               标记 executed。
-    # 排他 flock 与 manifest 发布临界区（引用校验->标签提交）互斥，因此：
+    # 排他 flock 与 manifest 发布临界区（引用校验->标签提交）及 blob 提交
+    # 临界区（单块重传/分块完成/跨仓库挂载的内容就位->关联落库）互斥，因此：
     # dry-run 之后新产生的垃圾（如标签移动刚制造的不可达对象）不在计划内，
     # 绝不会被未审阅地删除；重新可达或续租的对象自动跳过；发布先提交标签时
     # 候选重新可达被跳过，GC 先删完时发布的引用校验失败（400，标签不写入）。
+    # 同摘要重传/挂载同样被串行：重传先完成则按可达性/宽限期正常复核，GC
+    # 先删完则重传落下完整新文件并重建关联（挂载方按规范回退普通上传），
+    # 成功发布的标签引用必然可拉取。
     # 两个进程同时执行同一计划时，只有认领成功的一方删除，另一方 409 且不碰
     # 任何候选。认领后异常或崩溃，计划保持 executing（不可重放，flock 由内核
     # 自动释放），剩余候选可重新 dry-run 审阅。
@@ -558,10 +620,16 @@ class Registry:
 
         # ---- 2. 认领成功：以下区间同时持有进程锁与跨进程排他 flock。
         #         可达性复核 -> 元数据删除 -> blob 文件删除 -> 标记 executed
-        #         与任何并发发布（引用校验->标签提交）跨进程严格串行：
+        #         与任何并发发布（引用校验->标签提交）及 blob 提交
+        #         （单块重传/分块完成/跨仓库挂载的内容就位->关联落库）
+        #         跨进程严格串行：
         #         本区间内发布无法完成标签提交，因此复核时看不到的标签在
         #         删除完成前不会出现；区间结束后才发布的请求会重新校验并
-        #         发现 blob 已不存在（400 MANIFEST_BLOB_UNKNOWN，标签不变）。
+        #         发现 blob 已不存在（400 MANIFEST_BLOB_UNKNOWN，标签不变）；
+        #         同摘要重传在「已删元数据、未删文件」窗口内无法插入，
+        #         本区间先完成时它拿到锁后文件也已删除，os.replace 落下
+        #         完整新文件并重建关联（新记录受宽限期保护），重传先完成
+        #         时则按复核结果可达跳过/超期正常删除。
         #         异常时计划留在 executing，不回滚、不重放；flock 由内核
         #         在进程死亡时自动释放，不会僵死。 ----
         with self.lock, self.xlock.exclusive():

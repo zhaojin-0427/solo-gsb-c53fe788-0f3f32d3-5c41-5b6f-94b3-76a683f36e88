@@ -1047,6 +1047,243 @@ def test_cross_process_gc_deletes_before_publish_put_rejected_no_tag(settings):
     assert verifier.get(f"/v2/{repo}/blobs/{digest_of(keep_cfg)}").status_code == 200
 
 
+# ---------------- 同摘要重传/挂载 vs GC：跨进程删除窗口竞态 ----------------
+
+def _gc_worker_window_between_metadata_and_file(data_dir, plan_id, digest,
+                                                entered, proceed, queue):
+    """独立进程：认领计划后，在「已删 blob 元数据、未删 blob 文件」的
+    窗口内置位 entered 并阻塞在 proceed 事件上，确定性地把同摘要重传方
+    放进这段窗口。整个窗口位于跨进程排他 flock 之内。"""
+    try:
+        settings = Settings(data_dir=data_dir, upload_lease_seconds=3600,
+                            gc_grace_seconds=3600)
+        registry = Registry(settings)
+        real_delete_blobs = registry.db.delete_blobs
+
+        def _delete_blobs_then_pause(digests):
+            real_delete_blobs(digests)
+            if digest in digests:
+                entered.set()
+                proceed.wait(timeout=30)
+
+        registry.db.delete_blobs = _delete_blobs_then_pause
+        try:
+            registry.gc_execute(plan_id)
+            queue.put({"ok": True,
+                       "blob_gone": registry.db.get_blob(digest) is None})
+        except OCIError as exc:
+            queue.put({"ok": False, "status": exc.status_code, "code": exc.code})
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        queue.put({"fatal": f"{exc!r}\n{traceback.format_exc()}"})
+
+
+def _reupload_worker(data_dir, repo, digest, payload, mode, queue):
+    """独立进程：在 GC 的删除窗口内发起同摘要重传或跨仓库挂载。
+
+    mode:
+      - "mono":    POST .../uploads?digest= 单块整体重传；
+      - "chunked": POST 会话 -> PATCH -> PUT?digest= 分块提交；
+      - "mount":   POST .../uploads?mount=&from= 跨仓库挂载。
+    """
+    try:
+        settings = Settings(data_dir=data_dir, upload_lease_seconds=3600,
+                            gc_grace_seconds=3600)
+        registry = Registry(settings)
+        if mode == "mono":
+            registry.monolithic_upload(repo, payload, digest)
+            queue.put({"mode": mode, "committed": True})
+        elif mode == "chunked":
+            u = registry.start_upload(repo)
+            registry.append_chunk(repo, u["id"], payload, None)
+            d, size = registry.finalize_upload(repo, u["id"], digest, None)
+            queue.put({"mode": mode, "committed": True, "digest": d, "size": size})
+        elif mode == "mount":
+            from_repo = "src/repo"
+            mounted = registry.mount_blob(repo, digest)
+            queue.put({"mode": mode, "committed": False, "mounted": mounted,
+                       "src_has": registry.db.repo_has_blob(from_repo, digest)})
+        else:  # pragma: no cover
+            raise AssertionError(mode)
+    except OCIError as exc:
+        queue.put({"mode": mode, "fatal_code": exc.code, "status": exc.status_code})
+    except Exception as exc:  # noqa: BLE001
+        import traceback
+        queue.put({"mode": mode, "fatal": f"{exc!r}\n{traceback.format_exc()}"})
+
+
+def _run_reupload_during_gc_window(settings, plan_id, digest, repo, payload,
+                                   mode, queue):
+    data_dir = str(settings.data_dir)
+    ctx = multiprocessing.get_context("fork")
+    entered, proceed = ctx.Event(), ctx.Event()
+    gc = ctx.Process(target=_gc_worker_window_between_metadata_and_file,
+                     args=(data_dir, plan_id, digest, entered, proceed, queue))
+    other = ctx.Process(target=_reupload_worker,
+                        args=(data_dir, repo, digest, payload, mode, queue))
+    gc.start()
+    assert entered.wait(15), "GC never entered the metadata/file deletion window"
+    # 此刻 GC 已在排他 flock 内删掉 blob 元数据、文件仍在；重传方启动后
+    # 阻塞在同一把 flock 上
+    other.start()
+    time.sleep(0.8)
+    assert other.is_alive(), "reupload must be blocked by GC critical section"
+    proceed.set()
+    for p in (gc, other):
+        p.join(timeout=20)
+        assert not p.is_alive(), f"{p.name} timed out"
+        p.close()
+    results = []
+    while not queue.empty():
+        results.append(queue.get_nowait())
+    assert all("fatal" not in r and "fatal_code" not in r for r in results), results
+    return results
+
+
+def _gc_candidate(client, settings, repo: str, payload: bytes,
+                  src_repo: "str | None" = None):
+    """推送一个只在 src_repo（默认 repo）关联、无标签引用且老过宽限期的
+    blob，dry-run 出包含它的计划，返回 (plan_id, digest)。"""
+    push_from = src_repo or repo
+    d = push_blob(client, push_from, payload)
+    registry = client.app.state.registry
+    with registry.lock:
+        registry.db._conn.execute("UPDATE blobs SET created_at = 0")
+        registry.db._conn.commit()
+    plan = client.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert d in {b["digest"] for b in plan["delete"]["blobs"]}
+    registry.db._conn.commit()  # 确保计划已落盘
+    return plan["plan_id"], d
+
+
+def test_same_digest_monolithic_reupload_during_gc_window_lands_intact(settings):
+    """GC 先删：单块同摘要重传被 flock 挡到元数据与文件都删完之后，落下
+    完整新文件并重建关联；随后发布标签 201，GET blob 200（修复前为
+    commit_blob 见旧文件丢弃新内容、文件被 GC 删除的悬空记录）。"""
+    client = TestClient(create_app(settings))
+    repo = "race/reup"
+    payload = b"same digest retransmitted in gc window"
+    plan_id, d = _gc_candidate(client, settings, repo, payload)
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+
+    results = _run_reupload_during_gc_window(
+        settings, plan_id, d, repo, payload, "mono", queue
+    )
+    gcr = next(r for r in results if "blob_gone" in r)
+    reup = next(r for r in results if r.get("mode") == "mono")
+    assert gcr["ok"] is True and gcr["blob_gone"] is True, results
+    assert reup["committed"] is True
+
+    # 重传落下完整文件：记录与文件都在，GET/HEAD blob 成功
+    verifier = TestClient(create_app(settings))
+    r = verifier.get(f"/v2/{repo}/blobs/{d}")
+    assert r.status_code == 200, r.text
+    assert r.content == payload
+    assert verifier.head(f"/v2/{repo}/blobs/{d}").headers["Content-Length"] \
+        == str(len(payload))
+
+    # 随后发布引用它的标签：201，且标签与 blob 都可拉取（不再 201/404）
+    manifest = _layer_only_manifest(d, len(payload))
+    r = verifier.put(f"/v2/{repo}/manifests/v1", content=manifest,
+                     headers={"Content-Type": OCI_MANIFEST})
+    assert r.status_code == 201, r.text
+    assert verifier.get(f"/v2/{repo}/manifests/v1").content == manifest
+    assert verifier.get(f"/v2/{repo}/blobs/{d}").content == payload
+
+    # 重传产生的是新记录（受宽限期保护）：紧接着的 GC 不删它
+    p2 = verifier.post("/gc", json={"dry_run": True, "grace_seconds": 0}).json()
+    assert d not in {b["digest"] for b in p2["delete"]["blobs"]}
+
+
+def test_same_digest_chunked_finalize_during_gc_window_lands_intact(settings):
+    """同上，但是分块提交（PUT ?digest=）：finalize 的摘要复核与提交在
+    GC 释放锁之后完成，新文件与关联一致，标签可发布、blob 可拉取。"""
+    client = TestClient(create_app(settings))
+    repo = "race/chunk"
+    payload = b"chunked finalize racing gc " * 7
+    plan_id, d = _gc_candidate(client, settings, repo, payload)
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+
+    results = _run_reupload_during_gc_window(
+        settings, plan_id, d, repo, payload, "chunked", queue
+    )
+    gcr = next(r for r in results if "blob_gone" in r)
+    reup = next(r for r in results if r.get("mode") == "chunked")
+    assert gcr["ok"] is True and gcr["blob_gone"] is True, results
+    assert reup["committed"] is True
+    assert reup["digest"] == d and reup["size"] == len(payload)
+
+    verifier = TestClient(create_app(settings))
+    r = verifier.get(f"/v2/{repo}/blobs/{d}")
+    assert r.status_code == 200 and r.content == payload
+    manifest = _layer_only_manifest(d, len(payload))
+    r = verifier.put(f"/v2/{repo}/manifests/v1", content=manifest,
+                     headers={"Content-Type": OCI_MANIFEST})
+    assert r.status_code == 201, r.text
+    assert verifier.get(f"/v2/{repo}/manifests/v1").content == manifest
+    assert verifier.get(f"/v2/{repo}/blobs/{d}").content == payload
+
+
+def test_cross_repo_mount_during_gc_window_falls_back_to_upload(settings):
+    """GC 先删：跨仓库挂载方等锁后观察到 blob（元数据与文件）已不存在，
+    mount_blob 返回 False，路由按 OCI 规范回退为普通上传会话（202）。"""
+    client = TestClient(create_app(settings))
+    src, dst = "src/repo", "dst/repo"
+    payload = b"mount candidate racing gc"
+    plan_id, d = _gc_candidate(client, settings, dst, payload, src_repo=src)
+    ctx = multiprocessing.get_context("fork")
+    queue = ctx.Queue()
+
+    results = _run_reupload_during_gc_window(
+        settings, plan_id, d, dst, payload, "mount", queue
+    )
+    gcr = next(r for r in results if "blob_gone" in r)
+    mounter = next(r for r in results if r.get("mode") == "mount")
+    assert gcr["ok"] is True and gcr["blob_gone"] is True, results
+    assert mounter["mounted"] is False and mounter["src_has"] is False
+
+    verifier = TestClient(create_app(settings))
+    # HTTP 语义：挂载来源已不存在 -> 202 普通上传会话（而非 201 悬空挂载）
+    r = verifier.post(f"/v2/{dst}/blobs/uploads?mount={d}&from={src}")
+    assert r.status_code == 202, r.text
+    assert r.headers["Docker-Upload-UUID"]
+    assert verifier.get(f"/v2/{dst}/blobs/{d}").status_code == 404
+
+    # 回退会话可正常完成上传，随后标签发布与拉取成功
+    loc = r.headers["Location"]
+    r = verifier.put(f"{loc}?digest={d}", content=payload)
+    assert r.status_code == 201, r.text
+    assert verifier.get(f"/v2/{dst}/blobs/{d}").content == payload
+    manifest = _layer_only_manifest(d, len(payload))
+    r = verifier.put(f"/v2/{dst}/manifests/v1", content=manifest,
+                     headers={"Content-Type": OCI_MANIFEST})
+    assert r.status_code == 201
+    assert verifier.get(f"/v2/{dst}/manifests/v1").content == manifest
+
+
+def test_reupload_then_publish_first_gc_skips_reachable(client, settings):
+    """重传/标签先发布：候选重新可达，随后 GC 复核跳过，blob 可拉取。"""
+    repo = "race/first"
+    payload = b"reupload and publish before gc executes"
+    plan_id, d = _gc_candidate(client, settings, repo, payload)
+
+    # 复核窗口内重传同摘要（去重，不丢内容）并发布标签
+    r = client.post(f"/v2/{repo}/blobs/uploads?digest={d}", content=payload)
+    assert r.status_code == 201
+    manifest = _layer_only_manifest(d, len(payload))
+    r = client.put(f"/v2/{repo}/manifests/v1", content=manifest,
+                   headers={"Content-Type": OCI_MANIFEST})
+    assert r.status_code == 201
+
+    rep = client.post("/gc", json={"dry_run": False, "plan_id": plan_id}).json()
+    assert rep["summary"]["blobs_deleted"] == 0
+    assert rep["skipped"]["blobs"][0]["digest"] == d
+    assert client.get(f"/v2/{repo}/blobs/{d}").content == payload
+    assert client.get(f"/v2/{repo}/manifests/v1").content == manifest
+
+
 # ---------------- 重启恢复 ----------------
 
 def test_upload_survives_restart(settings):

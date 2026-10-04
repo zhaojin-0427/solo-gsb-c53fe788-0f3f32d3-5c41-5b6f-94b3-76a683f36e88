@@ -40,7 +40,15 @@ class FileStorage:
             pass
 
     def commit_blob(self, tmp_path: Path, digest: str) -> int:
-        """把上传临时文件落为内容寻址 blob；已存在则去重（删临时文件）。"""
+        """把上传临时文件落为内容寻址 blob；已存在则去重（删临时文件）。
+
+        调用方必须已持有跨进程排他锁（registry.xlock）：因此目标文件的
+        存在状态不会与 GC「先删元数据、后删文件」的窗口交错——目标已存在
+        即说明内容就位且元数据由同区间负责落库（摘要在调用前已对临时文件
+        复核，内容寻址保证两者字节一致），可安全去重；否则 os.replace
+        原子落位。若不持锁，旧文件可能是即将被 GC 删除的残留，去重会丢弃
+        新内容而留下悬空元数据。
+        """
         target = self.blob_path(digest)
         if target.exists():
             Path(tmp_path).unlink(missing_ok=True)
